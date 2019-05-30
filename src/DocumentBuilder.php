@@ -7,11 +7,14 @@ use Illuminate\Database\Eloquent\Factory as EloquentFactory;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Route;
 use Illuminate\Routing\Router;
+use Symfony\Component\Yaml\Yaml;
 use ReflectionClass;
 use ReflectionException;
 
 class DocumentBuilder
 {
+    const YAML_INLINE_LEVEL = 16;
+
     protected $models = [];
 
     protected $ignoreMethods = [
@@ -28,6 +31,8 @@ class DocumentBuilder
     protected $endpoints = [];
 
     protected $definitions = [];
+
+    protected $document;
 
     /**
      * @param Router $router
@@ -183,7 +188,7 @@ class DocumentBuilder
         ];
     }
 
-    public function toJson()
+    public function build()
     {
         $endpoints = collect($this->endpoints)->groupBy(function($endpoint) {
             return '/' . trim($endpoint['route']->uri(), '/');
@@ -195,7 +200,7 @@ class DocumentBuilder
             })->all();
         })->all();
 
-        $swaggerJson = [
+        $this->document = [
             'swagger' => '2.0',
             'info' => [
                 'version' => '1.0.0',
@@ -214,7 +219,7 @@ class DocumentBuilder
             'definitions' => $this->definitions,
         ];
 
-        return json_encode($swaggerJson, JSON_PRETTY_PRINT);
+        return $this;
     }
 
     protected function findResourceModel($resource)
@@ -249,5 +254,15 @@ class DocumentBuilder
         return (new $resource(
             factory($model)->create()
         ))->toArray(new Request);
+    }
+
+    public function toJson()
+    {
+        return json_encode($this->document, JSON_PRETTY_PRINT);
+    }
+
+    public function toYaml()
+    {
+        return Yaml::dump($this->document, self::YAML_INLINE_LEVEL);
     }
 }

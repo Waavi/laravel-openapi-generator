@@ -3,7 +3,8 @@
     "description": "OpenApi generator",
     "require": {
         "doctrine/annotations": "^1.6",
-        "illuminate/support": "5.*"
+        "illuminate/support": "5.*",
+        "symfony/yaml": "^4.3"
     },
     "license": "MIT",
     "authors": [
