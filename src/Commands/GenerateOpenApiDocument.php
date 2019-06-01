@@ -51,20 +51,43 @@ class GenerateOpenApiDocument extends Command
             $this->router->getRoutes()
         )->build();
 
-        $this->writeToFile($document->toYaml());
+        if ((bool) config('openapi-generator.write')) {
+            $this->writeToFile($document);
+        }
+
+        if ((bool) config('openapi-generator.print')) {
+            $this->print($document);
+        }
     }
 
     private function writeToFile($document)
     {
+        $this->info('Generating document...');
+
         $filename = config('openapi-generator.filename', 'openapi');
         $extension = config('openapi-generator.format', 'yaml');
         $output = config('openapi-generator.output', base_path());
 
+        $document = $this->formatDocument($document);
+
         file_put_contents("{$output}/{$filename}.{$extension}", $document);
+
+        $this->info('Generating document... done');
     }
 
     private function print($document)
     {
-        echo $document;
+        echo $this->formatDocument($document);
+    }
+
+    private function formatDocument($document)
+    {
+        if (config('format') === 'json') {
+            $document = $document->toJson();
+        } else {
+            $document = $document->toYaml();
+        }
+
+        return $document;
     }
 }

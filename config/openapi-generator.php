@@ -14,6 +14,16 @@ return [
      */
    'output_path' => base_path(),
 
-   'version' => '2',
+    /**
+     * The OpenApi Specification version to use.
+     * Accepted values are 2 and 3.
+     */
+    'version' => '2',
+
+    'filename' => 'openapi',
+
+    'write' => true,
+
+    'print' => false,
 
 ];
