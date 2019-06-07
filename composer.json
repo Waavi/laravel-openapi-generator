@@ -21,7 +21,7 @@
     "extra": {
         "laravel": {
             "providers": [
-                "Waavi\LaravelOpenApiGenerator\OpenApiGeneratorServiceProvider"
+                "Waavi\\LaravelOpenApiGenerator\\OpenApiGeneratorServiceProvider"
             ]
         }
     }
