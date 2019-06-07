@@ -17,5 +17,12 @@
         "psr-4": {
             "Waavi\\LaravelOpenApiGenerator\\": "src/"
         }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Waavi\LaravelOpenApiGenerator\OpenApiGeneratorServiceProvider"
+            ]
+        }
     }
 }
