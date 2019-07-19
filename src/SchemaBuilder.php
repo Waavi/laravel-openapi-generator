@@ -117,8 +117,7 @@ class SchemaBuilder
             return null;
         }
 
-        $request = new Request;
-        $request->setUserResolver(function($guard = null) {
+        $request = (new Request)->setUserResolver(function($guard = null) {
             $guard = $guard ?: config('auth.defaults.guard');
             $provider = config("auth.guards.{$guard}.provider");
             $model = config("auth.providers.{$provider}.model");
@@ -126,14 +125,16 @@ class SchemaBuilder
             return $this->buildModel($model);
         });
 
-        // Build a collection of resources
         if ($isCollection) {
-            $inputsColl = collect([$input, $input]);
-            return $resource::collection($inputsColl)->toArray($request);
+            // Build a resource collection
+            $inputs = collect([$input, $input]);
+            $response = $resource::collection($inputs)->toResponse($request);
+        } else {
+            // Build a single resource
+            $response = (new $resource($input))->toResponse($request);
         }
 
-        // Build a single resource
-        return (new $resource($input))->toArray($request);
+        return $response->getData($assoc = true);
     }
 
     protected function buildModel($model)
