@@ -4,7 +4,9 @@ namespace Waavi\LaravelOpenApiGenerator;
 
 use Closure;
 use Illuminate\Database\Eloquent\Factory as EloquentFactory;
+use Illuminate\Foundation\Http\FormRequest;
 use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\Resource;
 use Illuminate\Routing\Route;
 use Illuminate\Routing\Router;
 use Symfony\Component\Yaml\Yaml;
@@ -15,16 +17,15 @@ class DocumentBuilder
 {
     const YAML_INLINE_LEVEL = 16;
 
-    protected $models = [];
+    const YAML_INDENT_SPACES = 4;
 
-    protected $ignoreMethods = [
-        'HEAD',
-        'OPTIONS',
-    ];
+    protected $schemaBuilder;
 
-    protected $ignoreUris = [
-        '{fallbackPlaceholder}',
-    ];
+    protected $endpointMaps = [];
+
+    protected $ignoreMethods = ['HEAD', 'OPTIONS'];
+
+    protected $ignoreUris = ['{fallbackPlaceholder}'];
 
     protected $reflectionCache = [];
 
@@ -39,7 +40,8 @@ class DocumentBuilder
      */
     public function __construct()
     {
-        $this->models = $this->getFactoryModels();
+        $this->schemaBuilder = new SchemaBuilder;
+        $this->endpointMaps = config('openapi-generator.endpoint_maps', []);
     }
 
     protected function getFactoryModels()
@@ -96,6 +98,13 @@ class DocumentBuilder
         return $this->reflectionCache[$class];
     }
 
+    protected function parseRouteHandler($route)
+    {
+        $arr = explode('@', $route->getActionName());
+
+        return [$arr[0], $arr[1] ?? null];
+    }
+
     protected function generateEndpoints(Route $route)
     {
         $endpoints = [];
@@ -109,9 +118,18 @@ class DocumentBuilder
                 continue;
             }
 
-            list($className, $handlerName) = explode('@', $route->getActionName());
+            list($className, $methodName) = $this->parseRouteHandler($route);
 
-            $handler = $this->reflection($className)->getMethodData($handlerName);
+            if ($className === 'Closure') {
+                $handler = [
+                    'summary' => '',
+                    'description' => '',
+                    'resource' => null,
+                    'formRequest' => [],
+                ];
+            } else {
+                $handler = $this->reflection($className)->getMethodData($methodName);
+            }
 
             $endpoints[] = [
                 'method' => $method,
@@ -130,62 +148,170 @@ class DocumentBuilder
         })->all();
     }
 
-    protected function renderResponseSchema($className, $isCollection)
+    protected function buildTags($route)
     {
-        $definitionName = class_basename($className) . ($isCollection ? 'Collection' : '');
-        $reference = [ '$ref' => "#/definitions/{$definitionName}" ];
+        $tags = [];
 
-
-        if (!isset($this->definitions[$definitionName])) {
-            $example = $this->generateResourceExample($className, $isCollection);
-
-            $this->definitions[$definitionName] = [
-                'type' => 'object',
-                'example' => $example,
-            ];
+        if ($prefix = $route->getPrefix()) {
+            $tags = [trim($prefix, '/')];
         }
 
-        return $reference;
+        return $tags;
     }
 
     protected function renderEndpoint($route, $handler)
     {
+        $endpointId = $route->getName() ?: $route->getActionName();
         $middleware = $this->getMiddleware($route);
+        $tags = $this->buildTags($route);
 
-        $tags = [];
-        $schema = [ 'type' => 'object' ];
+        $endpointMap = $this->endpointMaps[$endpointId] ?? null;
 
-        $prefix = $route->getPrefix();
-        if ($prefix) {
-            $tags = [ trim($prefix, '/') ];
-        }
+        $schema = $this->renderSchema(
+            $endpointMap['response'] ?? $handler['resource'] ?? null
+        );
 
-        $returns = $handler['returns'];
-        if ($returns && $returns['type'] === 'class') {
-            $isCollection = !$returns['instance'] && $returns['method'] === 'collection';
-            $schema = $this->renderResponseSchema($returns['class'], $isCollection);
-        }
+        $parameters = array_merge(
+            $this->buildPathParams($route),
+            $this->buildQueryParams($endpointMap['request'] ?? $handler['formRequest'])
+        );
 
         return [
-            'summary' => 'Summary goes here',
+            'summary' => $handler['summary'] ?: '',
             'description' => $handler['description'] ?: '',
             'security' => [
-                [ 'Bearer' => [] ],
+                ['Bearer' => []],
             ],
             'tags' => $tags,
-            'operationId' => uniqid(),
-            'consumes' => [ 'application/json' ],
-            'produces' => [ 'application/json' ],
+            'operationId' => $endpointId,
+            'consumes' => ['application/json'],
+            'produces' => ['application/json'],
             'responses' => [
                 '200' => [
                     'description' => 'OK',
                     'schema' => $schema,
                 ]
             ],
-            'parameters' => collect($route->parameterNames())->map(function($param) {
-                return [ 'in' => 'path', 'name' => $param, 'required' => true, 'type' => 'string' ];
-            })->all(),
+            'parameters' => $parameters,
         ];
+    }
+
+    protected function renderSchema($response)
+    {
+        if (!is_string($response)) {
+            return $this->schemaBuilder->build($response);
+        }
+
+        $schemaRef = ['$ref' => '#/definitions/'.urlencode($response)];
+
+        if (isset($this->definitions[$response])) {
+            return $schemaRef;
+        }
+
+        $schema = $this->schemaBuilder->build($response);
+
+        $this->definitions[$response] = $schema;
+
+        return $schemaRef;
+    }
+
+    protected function buildPathParams($route)
+    {
+        return collect($route->parameterNames())
+            ->map(function($param) {
+                return [
+                    'in' => 'path',
+                    'name' => $param,
+                    'required' => true,
+                    'type' => 'string',
+                ];
+            })
+            ->all();
+    }
+
+    protected function buildQueryParams($request)
+    {
+        return $this->normalizeRules($request ?: [])
+            ->map(function($paramRules, $paramKey) {
+                $required = false;
+                $description = [];
+                $type = 'string';
+
+                foreach ($paramRules as $ruleStr) {
+                    list($rule, $params) = $this->parseRuleString($ruleStr);
+
+                    if ($rule === 'required' || $rule === 'present') {
+                        $required = true;
+                    }
+                    if ($rule === 'integer') {
+                        $type = 'integer';
+                    }
+                    if ($rule === 'numeric') {
+                        $type = 'number';
+                    }
+                    if ($rule === 'boolean') {
+                        $type = 'boolean';
+                    }
+                    if ($rule === 'nullable') {
+                        $description[] = 'Field may be null.';
+                    }
+                    if ($rule === 'required_if') {
+                        $description[] = "Required when {$params[0]}={$params[1]}.";
+                    }
+                    if ($rule === 'in') {
+                        $description[] = 'One of ' . implode(', ', $params) . '.';
+                    }
+                    if ($rule === 'between') {
+                        $description[] = 'Between ' . implode(' and ', $params) . '.';
+                    }
+                }
+
+                return [
+                    'in' => 'query',
+                    'name' => $paramKey,
+                    'required' => $required,
+                    'type' => $type,
+                    'description' => implode('<br>', $description),
+                ];
+            })
+            ->values()
+            ->all();
+    }
+
+    protected function normalizeRules($request)
+    {
+        $rules = [];
+
+        if (is_string($request) && is_subclass_of($request, FormRequest::class)) {
+            try {
+                $rules = (new $request)->rules();
+            } catch (\Exception $e) {
+                // TODO warning about failing to load FormRequest rules
+            }
+        }
+
+        if (!is_string($request)) {
+            $rules = $request;
+        }
+
+        return collect($rules)
+            ->map(function ($paramRules) {
+                return is_array($paramRules)
+                    ? $paramRules
+                    : explode('|', $paramRules);
+            })
+            ->map(function ($paramRules) {
+                return collect($paramRules)
+                    ->map(function ($rules) { return (string) $rules; })
+                    ->all();
+            });
+    }
+
+
+    protected function parseRuleString($rule)
+    {
+        $arr = explode(':', $rule);
+        return [$arr[0], explode(',', $arr[1] ?? '')];
     }
 
     public function build()
@@ -203,8 +329,8 @@ class DocumentBuilder
         $this->document = [
             'swagger' => '2.0',
             'info' => [
-                'version' => '1.0.0',
-                'title' => env('APP_NAME') ?: '',
+                'version' => env('APP_VERSION') ?: '1.0.0',
+                'title' => config('app.name') ?: '',
                 'description' => '',
             ],
             'securityDefinitions' => [
@@ -222,40 +348,6 @@ class DocumentBuilder
         return $this;
     }
 
-    protected function findResourceModel($resource)
-    {
-        $resourceName = class_basename($resource);
-
-        foreach ($this->models as $model) {
-            if (strpos($resourceName, class_basename($model))) {
-                return $model;
-            }
-        }
-
-        return null;
-    }
-
-    public function generateResourceExample($resource, $isCollection = false)
-    {
-        $model = $this->findResourceModel($resource);
-
-        if (!$model) {
-            return null;
-        }
-
-        // Build a collection of resources
-        if ($isCollection) {
-            return $resource::collection(
-                factory($model, 2)->create()
-            )->toArray(new Request);
-        }
-
-        // Build a single resource
-        return (new $resource(
-            factory($model)->create()
-        ))->toArray(new Request);
-    }
-
     public function toJson()
     {
         return json_encode($this->document, JSON_PRETTY_PRINT);
@@ -263,6 +355,11 @@ class DocumentBuilder
 
     public function toYaml()
     {
-        return Yaml::dump($this->document, self::YAML_INLINE_LEVEL);
+        return Yaml::dump(
+            $this->document,
+            self::YAML_INLINE_LEVEL,
+            self::YAML_INDENT_SPACES,
+            Yaml::DUMP_EMPTY_ARRAY_AS_SEQUENCE
+        );
     }
 }

@@ -3,16 +3,22 @@
 namespace Waavi\LaravelOpenApiGenerator;
 
 use Doctrine\Common\Annotations\TokenParser;
+use Illuminate\Foundation\Http\FormRequest;
 use ReflectionClass;
+use ReflectionMethod;
 
 class ClassReflection
 {
+    /** @var ReflectionClass */
     protected $reflection;
 
+    /** @var string */
     protected $content;
 
+    /** @var string */
     protected $namespace;
 
+    /** @var array */
     protected $aliases;
 
     public function __construct($class)
@@ -59,18 +65,46 @@ class ClassReflection
     {
         $methodRef = $this->reflection->getMethod($method);
 
-        $code = $this->getFileSlice(
-            $methodRef->getStartLine(),
-            $methodRef->getEndLine()
-        );
-
-        $resource = $this->findClassUsage($code, '[a-zA-Z0-9]+Resource') ?: null;
+        $description = $this->getComment($methodRef);
 
         return [
-            // TODO extract method description
-            'description' => $methodRef->getDocComment(),
-            'returns' => $resource,
+            'summary' => explode("\n", $description)[0],
+            'description' => $description,
+            'formRequest' => $this->findFormRequestParam($methodRef) ?: null,
+            'resource' => $this->findClassUsage($methodRef, '[a-zA-Z0-9]+Resource') ?: null,
         ];
+    }
+
+    protected function findFormRequestParam(ReflectionMethod $methodRef)
+    {
+        foreach ($methodRef->getParameters() as $paramRef) {
+            $classRef = $paramRef->getClass();
+
+            if ($classRef && $classRef->isSubclassOf(FormRequest::class)) {
+                return $classRef->getName();
+            }
+        }
+
+        return null;
+    }
+
+    protected function getComment(ReflectionMethod $methodRef)
+    {
+        $docComment = $methodRef->getDocComment();
+
+        // Clean up comment punctuation
+        $comment = collect(explode("\n", $docComment))
+            ->map(function($line) {
+                return trim($line, "\t\n /*");
+            })
+            // Remove lines with @param, @return, etc. Only keep comments.
+            ->filter(function($line) {
+                return !strlen($line) || $line[0] !== '@';
+            })
+            ->implode("\n");
+
+        // Remove empty starting and ending lines.
+        return trim($comment);
     }
 
     protected function getFileSlice($startLine, $endLine)
@@ -83,8 +117,13 @@ class ClassReflection
         ));
     }
 
-    protected function findClassUsage($code, $classRegex)
+    protected function findClassUsage(ReflectionMethod $methodRef, $classRegex)
     {
+        $code = $this->getFileSlice(
+            $methodRef->getStartLine(),
+            $methodRef->getEndLine()
+        );
+
         $methodRegex = '[a-zA-Z0-9_]+';
 
         // Attempt to find one of:
@@ -94,15 +133,20 @@ class ClassReflection
 
         preg_match($regex, $code, $matched);
 
-        if (!$matched || !count($matched)) {
-            return null;
+        if ($matched && count($matched)) {
+            $hasNew = trim($matched[1]) === 'new';
+            $className = $this->resolveClass($matched[2]);
+            $methodName = $matched[4] ?? null;
+
+            if ($hasNew) {
+                return $className;
+            }
+
+            if ($methodName) {
+                return "{$className}::{$methodName}";
+            }
         }
 
-        return [
-            'type' => 'class',
-            'class' => $this->resolveClass($matched[2]),
-            'instance' => trim($matched[1]) === 'new',
-            'method' => $matched[4] ?? null,
-        ];
+        return null;
     }
 }

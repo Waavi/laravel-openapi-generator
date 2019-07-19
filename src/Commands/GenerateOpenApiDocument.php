@@ -64,13 +64,12 @@ class GenerateOpenApiDocument extends Command
     {
         $this->info('Generating document...');
 
-        $filename = config('openapi-generator.filename', 'openapi');
-        $extension = config('openapi-generator.format', 'yaml');
-        $output = config('openapi-generator.output', base_path());
+        $outputFile = config('openapi-generator.output', base_path('openapi.yaml'));
+        $extension = pathinfo($outputFile, PATHINFO_EXTENSION);
 
-        $document = $this->formatDocument($document);
+        $document = $this->formatDocument($document, $extension);
 
-        file_put_contents("{$output}/{$filename}.{$extension}", $document);
+        file_put_contents($outputFile, $document);
 
         $this->info('Generating document... done');
     }
@@ -80,14 +79,17 @@ class GenerateOpenApiDocument extends Command
         echo $this->formatDocument($document);
     }
 
-    private function formatDocument($document)
+    private function formatDocument($document, $extension)
     {
-        if (config('format') === 'json') {
-            $document = $document->toJson();
-        } else {
-            $document = $document->toYaml();
+        if ($extension === 'json') {
+            return $document->toJson();
         }
 
-        return $document;
+        if ($extension === 'yml' || $extension === 'yaml') {
+            return $document->toYaml();
+        }
+
+        throw new \RuntimeException("Unknown document extension '{$extension}',"
+            . " must be either 'json' or 'yaml'");
     }
 }
