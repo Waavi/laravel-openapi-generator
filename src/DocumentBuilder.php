@@ -234,14 +234,19 @@ class DocumentBuilder
         return $this->normalizeRules($request ?: [])
             ->map(function($paramRules, $paramKey) {
                 $required = false;
-                $description = [];
                 $type = 'string';
+                $isArray = false;
+                $description = [];
 
                 foreach ($paramRules as $ruleStr) {
                     list($rule, $params) = $this->parseRuleString($ruleStr);
 
                     if ($rule === 'required' || $rule === 'present') {
-                        $required = true;
+                       $required = true;
+                    }
+                    if ($rule === 'array') {
+                        $description[] = 'Array field, can be set several times.';
+                        $isArray = true;
                     }
                     if ($rule === 'integer') {
                         $type = 'integer';
@@ -259,23 +264,39 @@ class DocumentBuilder
                         $description[] = "Required when {$params[0]}={$params[1]}.";
                     }
                     if ($rule === 'in') {
-                        $description[] = 'One of ' . implode(', ', $params) . '.';
+                        $description[] = 'One of ' . $this->listRuleParams($params) . '.';
                     }
                     if ($rule === 'between') {
-                        $description[] = 'Between ' . implode(' and ', $params) . '.';
+                        $description[] = 'Between ' . $this->listRuleParams($params, ' and ') . '.';
                     }
                 }
 
-                return [
+                $param = [
                     'in' => 'query',
                     'name' => $paramKey,
-                    'required' => $required,
-                    'type' => $type,
+                    'required' => false,
                     'description' => implode('<br>', $description),
                 ];
+
+                if ($isArray) {
+                    $param['type'] = 'array';
+                    $param['items'] = ['type' => $type];
+                } else {
+                    $param['type'] = $type;
+                }
+
+                return $param;
             })
             ->values()
             ->all();
+    }
+
+    protected function listRuleParams($params, $glue = ', ', $quote = '"')
+    {
+        return collect($params)->map(function($param) use ($quote) {
+            $param = trim($param, "'\"");
+            return $quote.$param.$quote;
+        })->implode($glue);
     }
 
     protected function normalizeRules($request)
