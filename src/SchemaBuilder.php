@@ -6,6 +6,7 @@ use Illuminate\Database\Eloquent\Factory as EloquentFactory;
 use Illuminate\Http\Request;
 use Illuminate\Http\Resources\Json\JsonResource;
 use Illuminate\Http\Resources\Json\Resource;
+use Illuminate\Pagination\LengthAwarePaginator;
 use InvalidArgumentException;
 use ReflectionClass;
 use ReflectionException;
@@ -14,13 +15,14 @@ class SchemaBuilder
 {
     protected $models = [];
 
-    protected $resourceMaps = [];
+    protected $classMaps = [];
 
-    protected $reflectionCache = [];
+    protected $resourceMaps = [];
 
     public function __construct()
     {
         $this->models = $this->getFactoryModels();
+        $this->classMaps = config('openapi-generator.class_maps', []);
         $this->resourceMaps = config('openapi-generator.resource_maps', []);
     }
 
@@ -48,75 +50,60 @@ class SchemaBuilder
         return $propReflection->getValue($object);
     }
 
-    /**
-     * @param $class
-     * @return ClassReflection
-     */
-    protected function reflection($class)
+    public function build($response)
     {
-        if (!isset($this->reflectionCache[$class])) {
-            $this->reflectionCache[$class] = new ClassReflection($class);
-        }
-        return $this->reflectionCache[$class];
-    }
-
-    // 'action' might have the formats:
-    // 'App\Http\Resources\MyResource'
-    // 'App\Http\Resources\MyResource::collection'
-    // 'App\Whatever\MyClass@method'
-    // 'non-class-string'
-    // [ 'foo' => 'bar' ]
-    public function build($action)
-    {
-        if (!is_string($action)) {
-            return ['type' => 'object', 'example' => $action];
+        if (!$response) {
+            return ['type' => 'object', 'example' => []];
         }
 
-        try {
-            $example = null;
-            list($class, $method, $static) = $this->parseClassName($action);
+        if (!isset($response['type'])) {
+            return ['type' => 'object', 'example' => $response];
+        }
 
-            if (is_subclass_of($class, Resource::class) || is_subclass_of($class, JsonResource::class)) {
-                $example = $this->buildResourceOutput($class,
-                    $static && $method === 'collection'
+        if ($response['type'] === 'value') {
+            return ['type' => 'object', 'example' => $response['data']];
+        }
+
+        if ($response['type'] === 'class') {
+            $class = $response['class'];
+
+            if (isset($this->classMaps[$class])) {
+                $data = $this->classMaps[$class];
+            } else {
+                $data = $response['class'];
+            }
+
+            return ['type' => 'object', 'example' => $data];
+        }
+
+        if ($response['type'] === 'resource') {
+            $resource = $response['resource'];
+
+            try {
+                if (!$input = $this->buildResourceInput($response)) {
+                    echo "Error: cannot build resource '{$resource}'\n";
+                    echo json_encode($response, JSON_PRETTY_PRINT) . "\n";
+                    return ['type' => 'object', 'example' => $resource];
+                }
+
+                $data = $this->buildResourceResponse($resource, $input,
+                    $response['collection'],
+                    $response['param']['paginate'] ?? false
                 );
-            }
 
-            if ($example === null) {
-                $example = $class;
+                return ['type' => 'object', 'example' => $data];
+            } catch (\Exception $e) {
+                echo "Error: cannot instance resource '{$resource}'\n";
+                echo get_class($e).": {$e->getMessage()}\n";
+                return ['type' => 'object', 'example' => $resource];
             }
-
-            return ['type' => 'object', 'example' => $example];
-        } catch (ReflectionException $e) {
-            return ['type' => 'string', 'example' => 'object'];
         }
+
+        return ['type' => 'object', 'example' => $response];
     }
 
-    protected function parseClassName($action)
+    public function buildResourceResponse($resource, $input, $isCollection, $isPaginated)
     {
-        $parts = explode('@', $action);
-
-        if (count($parts) === 2) {
-            return [$parts[0], $parts[1], false];
-        }
-
-        $parts = explode('::', $action);
-
-        if (count($parts) === 2) {
-            return [$parts[0], $parts[1], true];
-        }
-
-        return [$action, null, false];
-    }
-
-    public function buildResourceOutput($resource, $isCollection = false)
-    {
-        $input = $this->buildResourceInput($resource);
-
-        if ($input === null) {
-            return null;
-        }
-
         $request = (new Request)->setUserResolver(function($guard = null) {
             $guard = $guard ?: config('auth.defaults.guard');
             $provider = config("auth.guards.{$guard}.provider");
@@ -128,20 +115,25 @@ class SchemaBuilder
         if ($isCollection) {
             // Build a resource collection
             $inputs = collect([$input, $input]);
-            $response = $resource::collection($inputs)->toResponse($request);
+
+            // Build pagination
+            if ($isPaginated) {
+                $inputs = new LengthAwarePaginator($inputs, 2, 15);
+            }
+
+            $resp = $resource::collection($inputs)->toResponse($request);
         } else {
             // Build a single resource
-            $response = (new $resource($input))->toResponse($request);
+            $resp = (new $resource($input))->toResponse($request);
         }
 
-        return $response->getData($assoc = true);
+        return $resp->getData($assoc = true);
     }
 
     protected function buildModel($model)
     {
-        $makeOrCreate = config('openapi-generator.create_factories', false)
-            ? 'create'
-            : 'make';
+        $shouldCreate = config('openapi-generator.create_factories', false);
+        $makeOrCreate = $shouldCreate ? 'create' : 'make';
 
         // Make/create the model from a factory. If the 'openapi' state exists,
         // apply it.
@@ -155,11 +147,26 @@ class SchemaBuilder
         }
     }
 
-    protected function buildResourceInput($resource)
+    protected function buildResourceInput($response)
     {
-        $input = isset($this->resourceMaps[$resource])
-            ? $this->resourceMaps[$resource]
-            : $this->findResourceModel($resource);
+        $resource = $response['resource'];
+        $paramType = $response['param']['type'] ?? null;
+
+        if (isset($this->resourceMaps[$resource])) {
+            $input = $this->resourceMaps[$resource];
+        } else if ($model = $this->findResourceModel($resource)) {
+            $input = $model;
+        } else if ($paramType === 'model') {
+            $input = $response['param']['model'];
+        } else if ($paramType === 'class') {
+            $input = $response['param']['class'];
+        } else if ($paramType === 'value') {
+            $input = $response['param']['data'];
+        } else {
+            $input = null;
+        }
+
+        echo "{$resource} => {$input}\n";
 
         if ($input === null) {
             return null;
@@ -181,6 +188,8 @@ class SchemaBuilder
         try {
             return app()->make($input);
         } catch (\ReflectionException $e) {
+            echo "Error: cannot make class '{$input}'\n";
+
             // Class does not exist, assume its a value
             // that the resource can receive directly.
             return $input;

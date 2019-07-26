@@ -35,9 +35,6 @@ class DocumentBuilder
 
     protected $document;
 
-    /**
-     * @param Router $router
-     */
     public function __construct()
     {
         $this->schemaBuilder = new SchemaBuilder;
@@ -88,12 +85,12 @@ class DocumentBuilder
 
     /**
      * @param $class
-     * @return ClassReflection
+     * @return ControllerParser
      */
     protected function reflection($class)
     {
         if (!isset($this->reflectionCache[$class])) {
-            $this->reflectionCache[$class] = new ClassReflection($class);
+            $this->reflectionCache[$class] = (new ControllerParser)->parseClass($class);
         }
         return $this->reflectionCache[$class];
     }
@@ -124,11 +121,12 @@ class DocumentBuilder
                 $handler = [
                     'summary' => '',
                     'description' => '',
-                    'resource' => null,
+                    'parameters' => [],
+                    'responses' => [],
                     'formRequest' => [],
                 ];
             } else {
-                $handler = $this->reflection($className)->getMethodData($methodName);
+                $handler = $this->reflection($className)->getRoute($methodName);
             }
 
             $endpoints[] = [
@@ -161,18 +159,26 @@ class DocumentBuilder
 
     protected function renderEndpoint($route, $handler)
     {
-        $endpointId = $route->getName() ?: $route->getActionName();
+        $endpointId = trim($route->getName() ?: $route->getActionName(), '\\');
         $middleware = $this->getMiddleware($route);
         $tags = $this->buildTags($route);
 
         $endpointMap = $this->endpointMaps[$endpointId] ?? null;
 
+        $resource = collect($handler['responses'])->filter(function($resp) {
+            return $resp['code'] === 200 || $resp['code'] === 201;
+        })->sortBy(function($resp) {
+            if ($resp['type'] === 'resource') return 1;
+            if ($resp['type'] === 'value') return 2;
+            return 3;
+        })->first();
+
         $schema = $this->renderSchema(
-            $endpointMap['response'] ?? $handler['resource'] ?? null
+            $endpointMap['response'] ?? $resource ?: null
         );
 
         $parameters = array_merge(
-            $this->buildPathParams($route),
+            $this->buildPathParams($route, $handler),
             $this->buildQueryParams($endpointMap['request'] ?? $handler['formRequest'])
         );
 
@@ -198,35 +204,53 @@ class DocumentBuilder
 
     protected function renderSchema($response)
     {
-        if (!is_string($response)) {
+        if (($response['type'] ?? null) !== 'resource') {
             return $this->schemaBuilder->build($response);
         }
 
-        $schemaRef = ['$ref' => '#/definitions/'.urlencode($response)];
+        $definition = $response['resource'];
 
-        if (isset($this->definitions[$response])) {
+        if ($response['collection']) {
+            $definition .= '::collection';
+        }
+
+        $schemaRef = ['$ref' => '#/definitions/'.urlencode($definition)];
+
+        if (isset($this->definitions[$definition])) {
             return $schemaRef;
         }
 
         $schema = $this->schemaBuilder->build($response);
 
-        $this->definitions[$response] = $schema;
+        $this->definitions[$definition] = $schema;
 
         return $schemaRef;
     }
 
-    protected function buildPathParams($route)
+    protected function buildPathParams($route, $handler)
     {
-        return collect($route->parameterNames())
-            ->map(function($param) {
-                return [
-                    'in' => 'path',
-                    'name' => $param,
-                    'required' => true,
-                    'type' => 'string',
-                ];
-            })
-            ->all();
+        return collect($route->parameterNames())->map(function($param) use ($handler) {
+            $type = 'string';
+            $description = '';
+
+            $model = $handler['parameters'][$param]['model'] ?? null;
+
+            if ($model) {
+                $instance = new $model;
+                if ($instance->getKeyType() === 'int') {
+                    $type = 'integer';
+                }
+                $description = class_basename($model)." model {$instance->getKeyName()}";
+            }
+
+            return [
+                'in' => 'path',
+                'name' => $param,
+                'required' => true,
+                'type' => $type,
+                'description' => $description,
+            ];
+        })->all();
     }
 
     protected function buildQueryParams($request)
@@ -242,7 +266,7 @@ class DocumentBuilder
                     list($rule, $params) = $this->parseRuleString($ruleStr);
 
                     if ($rule === 'required' || $rule === 'present') {
-                       $required = true;
+                        $required = true;
                     }
                     if ($rule === 'array') {
                         $description[] = 'Array field, can be set several times.';
@@ -269,12 +293,15 @@ class DocumentBuilder
                     if ($rule === 'between') {
                         $description[] = 'Between ' . $this->listRuleParams($params, ' and ') . '.';
                     }
+                    if ($rule === 'unique') {
+                        $description[] = 'Must be unique.';
+                    }
                 }
 
                 $param = [
                     'in' => 'query',
                     'name' => $paramKey,
-                    'required' => false,
+                    'required' => $required,
                     'description' => implode('<br>', $description),
                 ];
 
@@ -307,7 +334,7 @@ class DocumentBuilder
             try {
                 $rules = (new $request)->rules();
             } catch (\Exception $e) {
-                // TODO warning about failing to load FormRequest rules
+                echo "Error: cannot build FormRequest '{$request}'\n";
             }
         }
 

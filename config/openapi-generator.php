@@ -28,11 +28,19 @@ return [
      * Wether models instanced from factories to create
      * endpoints schemas should be saved to the database.
      *
-     * when this option is set to true, models will be
+     * When this option is set to true, models will be
      * created through `factory()->create()` instead of
      * the default `factory()->make()`.
      */
     'create_factories' => false,
+
+    /**
+     * Map a known class to a custom output to show when
+     * it is returned as a route's output.
+     */
+    'class_maps' => [
+        App\MyClass::class => [],
+    ],
 
     /**
      * Map a known Resource to a Model or custom input.
