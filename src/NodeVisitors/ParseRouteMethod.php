@@ -215,7 +215,9 @@ class ParseRouteMethod extends BaseNodeVisitor
         }
 
         if ($node instanceof Node\Expr\MethodCall) {
-            if ($var = $this->resolveVariable($node->var->name ?? '')) {
+            $varNode = $this->findVariable($node);
+
+            if ($varNode && $var = $this->resolveVariable($varNode->name)) {
                 if ($var['type'] === 'model' && !($var['paginate'] ?? false)) {
                     $var['paginate'] = !!$this->searchMethod($node, 'paginate');
                 }
@@ -294,8 +296,13 @@ class ParseRouteMethod extends BaseNodeVisitor
             return $node instanceof Node\Expr\StaticCall
                 || $node instanceof Node\Expr\New_;
         });
+    }
 
-        return $found ? $found->class->toString() : null;
+    protected function findVariable($node)
+    {
+        return $this->findFirst($node, function($node) {
+            return $node instanceof Node\Expr\Variable;
+        });
     }
 
     protected function searchMethod($node, $methodName)
