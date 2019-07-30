@@ -115,28 +115,36 @@ class DocumentBuilder
                 continue;
             }
 
-            list($className, $methodName) = $this->parseRouteHandler($route);
-
-            if ($className === 'Closure') {
-                $handler = [
-                    'summary' => '',
-                    'description' => '',
-                    'parameters' => [],
-                    'responses' => [],
-                    'formRequest' => [],
-                ];
-            } else {
-                $handler = $this->reflection($className)->getRoute($methodName);
-            }
-
-            $endpoints[] = [
-                'method' => $method,
-                'route' => $route,
-                'handler' => $handler,
-            ];
+            $endpoints[] = $this->generateEndpoint($method, $route);
         }
 
         return $endpoints;
+    }
+
+    protected function generateEndpoint($method, Route $route)
+    {
+        $endpoint = [
+            'id' => trim($route->getName() ?: $route->getActionName(), '\\'),
+            'tags' => $this->buildTags($route),
+            'middleware' => $this->getMiddleware($route),
+            'httpMethod' => $method,
+            'route' => $route,
+            'summary' => '',
+            'description' => '',
+            'parameters' => [],
+            'responses' => [],
+            'formRequest' => null,
+        ];
+
+        list($className, $methodName) = $this->parseRouteHandler($route);
+
+        if ($className === 'Closure') {
+            return $endpoint;
+        }
+
+        $handler = $this->reflection($className)->getRoute($methodName);
+
+        return $handler + $endpoint;
     }
 
     protected function getMiddleware($route)
@@ -157,39 +165,23 @@ class DocumentBuilder
         return $tags;
     }
 
-    protected function renderEndpoint($route, $handler)
+    protected function renderEndpoint($endpoint)
     {
-        $endpointId = trim($route->getName() ?: $route->getActionName(), '\\');
-        $middleware = $this->getMiddleware($route);
-        $tags = $this->buildTags($route);
-
-        $endpointMap = $this->endpointMaps[$endpointId] ?? null;
-
-        $resource = collect($handler['responses'])->filter(function($resp) {
-            return $resp['code'] === 200 || $resp['code'] === 201;
-        })->sortBy(function($resp) {
-            if ($resp['type'] === 'resource') return 1;
-            if ($resp['type'] === 'value') return 2;
-            return 3;
-        })->first();
-
-        $schema = $this->renderSchema(
-            $endpointMap['response'] ?? $resource ?: null
-        );
-
         $parameters = array_merge(
-            $this->buildPathParams($route, $handler),
-            $this->buildQueryParams($endpointMap['request'] ?? $handler['formRequest'])
+            $this->buildPathParams($endpoint),
+            $this->buildQueryParams($endpoint)
         );
+
+        $schema = $this->renderSchema($endpoint);
 
         return [
-            'summary' => $handler['summary'] ?: '',
-            'description' => $handler['description'] ?: '',
+            'summary' => $endpoint['summary'] ?: '',
+            'description' => $endpoint['description'] ?: '',
             'security' => [
                 ['Bearer' => []],
             ],
-            'tags' => $tags,
-            'operationId' => $endpointId,
+            'tags' => $endpoint['tags'],
+            'operationId' => $endpoint['id'],
             'consumes' => ['application/json'],
             'produces' => ['application/json'],
             'responses' => [
@@ -202,8 +194,20 @@ class DocumentBuilder
         ];
     }
 
-    protected function renderSchema($response)
+    protected function renderSchema($endpoint)
     {
+        $endpointMap = $this->endpointMaps[$endpoint['id']] ?? null;
+
+        $resource = collect($endpoint['responses'])->filter(function($resp) {
+            return $resp['code'] === 200 || $resp['code'] === 201;
+        })->sortBy(function($resp) {
+            if ($resp['type'] === 'resource') return 1;
+            if ($resp['type'] === 'value') return 2;
+            return 3;
+        })->first();
+
+        $response = $endpointMap['response'] ?? $resource ?: null;
+
         if (($response['type'] ?? null) !== 'resource') {
             return $this->schemaBuilder->build($response);
         }
@@ -227,20 +231,20 @@ class DocumentBuilder
         return $schemaRef;
     }
 
-    protected function buildPathParams($route, $handler)
+    protected function buildPathParams($endpoint)
     {
-        return collect($route->parameterNames())->map(function($param) use ($handler) {
+        return collect($endpoint['route']->parameterNames())->map(function($param) use ($endpoint) {
             $type = 'string';
             $description = '';
 
-            $model = $handler['parameters'][$param]['model'] ?? null;
+            $model = $endpoint['parameters'][$param]['model'] ?? null;
 
             if ($model) {
                 $instance = new $model;
                 if ($instance->getKeyType() === 'int') {
                     $type = 'integer';
                 }
-                $description = class_basename($model)." model {$instance->getKeyName()}";
+                $description = class_basename($model)." model {$instance->getRouteKeyName()}";
             }
 
             return [
@@ -253,9 +257,9 @@ class DocumentBuilder
         })->all();
     }
 
-    protected function buildQueryParams($request)
+    protected function buildQueryParams($endpoint)
     {
-        return $this->normalizeRules($request ?: [])
+        return $this->normalizeRules($endpoint)
             ->map(function($paramRules, $paramKey) {
                 $required = false;
                 $type = 'string';
@@ -326,15 +330,55 @@ class DocumentBuilder
         })->implode($glue);
     }
 
-    protected function normalizeRules($request)
+    protected function buildFormRequest($requestClass, $endpoint)
     {
+        $route = clone $endpoint['route'];
+
+        $request = (new $requestClass)->setRouteResolver(function() use ($route) {
+            return $route;
+        });
+
+        $route->bind($request);
+
+        foreach ($endpoint['parameters'] as $param) {
+            if ($param['type'] === 'model') {
+                $route->setParameter($param['name'], $this->buildModel($param['model']));
+            }
+        }
+
+        return $request;
+    }
+
+    protected function buildModel($model)
+    {
+        $shouldCreate = config('openapi-generator.create_factories', false);
+        $makeOrCreate = $shouldCreate ? 'create' : 'make';
+
+        // Make/create the model from a factory. If the 'openapi' state exists,
+        // apply it.
+        // The user may have defined custom properties, afterMakingState() or
+        // afterCreatingState() hooks only for this state, so models can be
+        // instanced differently when generating the OpenApi document.
+        try {
+            return factory($model)->states('openapi')->{$makeOrCreate}();
+        } catch (\InvalidArgumentException $e) {
+            return factory($model)->{$makeOrCreate}();
+        }
+    }
+
+    protected function normalizeRules($endpoint)
+    {
+        $endpointMap = $this->endpointMaps[$endpoint['id']] ?? null;
+
+        $request = $endpointMap['request'] ?? $endpoint['formRequest'];
+
         $rules = [];
 
         if (is_string($request) && is_subclass_of($request, FormRequest::class)) {
             try {
-                $rules = (new $request)->rules();
+                $rules = $this->buildFormRequest($request, $endpoint)->rules();
             } catch (\Exception $e) {
-                echo "Error: cannot build FormRequest '{$request}'\n";
+                echo "Error: cannot build {$request}: {$e->getMessage()}\n";
             }
         }
 
@@ -368,9 +412,9 @@ class DocumentBuilder
             return '/' . trim($endpoint['route']->uri(), '/');
         })->map(function($endpoints) {
             return $endpoints->keyBy(function($endpoint) {
-                return strtolower($endpoint['method']);
+                return strtolower($endpoint['httpMethod']);
             })->map(function($endpoint) {
-                return $this->renderEndpoint($endpoint['route'], $endpoint['handler']);
+                return $this->renderEndpoint($endpoint);
             })->all();
         })->all();
 
