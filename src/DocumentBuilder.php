@@ -144,7 +144,7 @@ class DocumentBuilder
 
         $handler = $this->reflection($className)->getRoute($methodName);
 
-        return $handler + $endpoint;
+        return ($handler ?: []) + $endpoint;
     }
 
     protected function getMiddleware($route)
